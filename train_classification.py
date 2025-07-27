@@ -1,0 +1,649 @@
+import torch
+import torch.nn.functional as F
+# >>> NEW IMPORTS
+import pandas as pd
+import os
+from torch.utils.data import Dataset
+# <<< END NEW IMPORTS
+from torch.utils.data import DataLoader
+from torch_geometric.data import Data, Batch
+from torch_geometric.seed import seed_everything
+from model.UniSAGE import UniSAGE
+from sklearn.metrics import roc_auc_score
+import numpy as np
+from tqdm import tqdm
+import argparse
+
+# Example of how to load and use the dataset
+def load_dataset(processed_path):
+    """
+    Load the saved dataset
+    """
+    # NOTE: This path should point to your preprocessed full graph data
+    dataset_path = processed_path
+    print(f"Loading preprocessed graph data from: {dataset_path}")
+
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(
+            f"Graph dataset not found at '{dataset_path}'. "
+            "Please run the preprocessing script first."
+        )
+    
+    # Solution for PyTorch 2.6+ compatibility
+    try:
+        # Method 1: Use weights_only=False (simple solution)
+        dataset = torch.load(dataset_path, weights_only=False)
+    except Exception as e:
+        print(f"Method 1 failed: {e}")
+        try:
+            # Method 2: Use safe_globals (more secure)
+            with torch.serialization.safe_globals([Data, Batch]):
+                dataset = torch.load(dataset_path)
+        except Exception as e2:
+            print(f"Method 2 failed: {e2}")
+            # Method 3: Add safe globals permanently
+            torch.serialization.add_safe_globals([Data, Batch])
+            dataset = torch.load(dataset_path)
+    
+    print(f"Loaded dataset with {len(dataset)} graphs")
+    
+    return dataset
+
+
+class TaskDataset(Dataset):
+    """
+    A PyTorch Dataset that combines a task file (e.g., from a CSV or Parquet)
+    with a pre-processed graph map.
+    """
+    def __init__(self, task_df: pd.DataFrame, graph_map: dict, config: dict):
+        self.tasks = task_df
+        self.graph_map = graph_map
+        self.entity_id_col = config['entity_id_col']
+        self.label_col = config['label_col']
+        self.timestamp_col = config['timestamp_col']
+
+    def __len__(self):
+        return len(self.tasks)
+
+    def __getitem__(self, idx):
+        task_row = self.tasks.iloc[idx]
+        entity_id = task_row[self.entity_id_col]
+        full_graph = self.graph_map.get(entity_id)
+        
+        if full_graph is None:
+            return None
+
+        if full_graph.num_nodes > 100000:
+            print(f"Warning: Graph for entity {entity_id} has {full_graph.num_nodes} nodes, which is too large.")
+
+        data = full_graph.clone()
+        
+        label_value = task_row[self.label_col]
+        data.y = torch.tensor([int(label_value)], dtype=torch.long)
+
+        task_timestamp = task_row[self.timestamp_col]
+        data.task_timestamp = torch.tensor([int(task_timestamp.timestamp())], dtype=torch.long)
+
+        return data
+
+# <<< MODIFIED: 重写 custom_collate 函数以修复 KeyError >>>
+def custom_collate(batch):
+    """
+    Custom collate function to properly handle edge_index_by_depth and list_index_sequences_by_depth
+    when batching graphs together. Updates node indices correctly.
+    This version avoids the default collate function's issues with dictionary attributes
+    that have varying keys across data objects.
+    """
+    # 1. 创建一个新的批次列表，其中不包含需要手动处理的字典属性。
+    #    这样可以安全地使用默认的 `Batch.from_data_list`。
+    batch_for_default_collate = []
+    for data in batch:
+        # 创建一个新的Data对象，只复制“安全”的属性
+        new_data = Data()
+        for key in data.keys():
+            # 排除我们将手动合并的字典属性
+            if key not in ['edge_index_by_depth', 'list_index_sequences_by_depth']:
+                new_data[key] = data[key]
+        batch_for_default_collate.append(new_data)
+    
+    # 2. 【关键修复】在“清理过”的批次上安全地调用默认合并函数。
+    #    我们使用 `batch_for_default_collate` 而不是原始的 `batch`，
+    #    以避免 PyG 自动处理我们那两个具有不同键的字典。
+    batch_data = Batch.from_data_list(batch_for_default_collate)
+
+    # 3. 手动合并之前被排除的字典属性。
+    #    这部分逻辑与您之前的代码相同，是正确的。
+    batch_edge_index_by_depth = {}
+    batch_list_index_sequences_by_depth = {}
+    
+    node_offsets = [0]
+    # 重要: 必须遍历原始批次以获取正确的 num_nodes 和自定义属性
+    for data in batch:
+        node_offsets.append(node_offsets[-1] + data.num_nodes)
+    node_offsets = node_offsets[:-1]
+    
+    # 遍历原始批次中的每个图
+    for graph_idx, data in enumerate(batch):
+        offset = node_offsets[graph_idx]
+        
+        # 合并 edge_index_by_depth
+        if hasattr(data, 'edge_index_by_depth') and data.edge_index_by_depth is not None:
+            for depth, edges in data.edge_index_by_depth.items():
+                if depth not in batch_edge_index_by_depth:
+                    batch_edge_index_by_depth[depth] = []
+                for edge in edges:
+                    updated_edge = [edge[0] + offset, edge[1] + offset]
+                    batch_edge_index_by_depth[depth].append(updated_edge)
+        
+        # 合并 list_index_sequences_by_depth
+        if hasattr(data, 'list_index_sequences_by_depth') and data.list_index_sequences_by_depth is not None:
+            for depth, sequences in data.list_index_sequences_by_depth.items():
+                if depth not in batch_list_index_sequences_by_depth:
+                    batch_list_index_sequences_by_depth[depth] = []
+                for seq in sequences:
+                    updated_seq = [node_idx + offset for node_idx in seq]
+                    batch_list_index_sequences_by_depth[depth].append(updated_seq)
+    
+    # 4. 将手动合并好的属性添加到最终的批次对象中。
+    batch_data.edge_index_by_depth = batch_edge_index_by_depth
+    batch_data.list_index_sequences_by_depth = batch_list_index_sequences_by_depth
+    
+    return batch_data
+# <<< END MODIFIED >>>
+
+def custom_collate_safe(batch):
+    """A safe wrapper for the collate function that filters out None values."""
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None
+    return custom_collate(batch)
+
+
+def create_dataloaders(train_tasks, val_tasks, test_tasks, graph_map, task_config, batch_size=4):
+    """Creates dataloaders from task DataFrames and a graph map."""
+    train_dataset = TaskDataset(train_tasks, graph_map, task_config)
+    val_dataset = TaskDataset(val_tasks, graph_map, task_config)
+    test_dataset = TaskDataset(test_tasks, graph_map, task_config)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_safe)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_safe)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_safe)
+    
+    print(f"Train tasks: {len(train_dataset)}")
+    print(f"Val tasks: {len(val_dataset)}")
+    print(f"Test tasks: {len(test_dataset)}")
+    print(f"Batch size: {batch_size}")
+    
+    return train_loader, val_loader, test_loader
+
+
+class Model(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, num_classes,num_heads=4, ssagg_lambda=1.0, dropout=0.3, orthogonal_lambda=0.1):
+        super(Model, self).__init__()
+        self.orthogonal_lambda = orthogonal_lambda
+        
+        self.unisage = UniSAGE(
+            in_channels=in_channels, 
+            out_channels=num_classes,
+            num_heads=num_heads,
+            hidden_channels=hidden_channels,
+            ssagg_lambda=ssagg_lambda,
+            dropout=dropout,
+            orthogonal_method='loss'
+        )
+        
+    def forward(self, x, edge_index_by_depth, list_index_sequences_by_depth, batch):
+        x = self.unisage(x, edge_index_by_depth, list_index_sequences_by_depth)
+        root_indices = self.get_root_indices(batch)
+        graph_representations = x[root_indices]
+        return graph_representations
+    
+    def get_orthogonal_loss(self):
+        return self.unisage.get_orthogonal_loss()
+    
+    def use_orthogonal_loss(self):
+        return self.unisage.use_orthogonal_loss()
+    
+    def get_root_indices(self, batch):
+        root_indices = []
+        current_offset = 0
+        unique_graphs = torch.unique(batch, sorted=True)
+        for graph_id in unique_graphs:
+            root_indices.append(current_offset)
+            nodes_in_graph = (batch == graph_id).sum().item()
+            current_offset += nodes_in_graph
+        return torch.tensor(root_indices, dtype=torch.long, device=batch.device)
+    
+    def reset_parameters(self):
+        if hasattr(self.unisage, 'reset_parameters'):
+            self.unisage.reset_parameters()
+
+# >>> NEW: Encapsulated time masking logic into a reusable function
+def apply_time_mask(batch, device, debug_first_batch=False):
+    """
+    Applies time masking to a batch of graphs.
+    Filters edges and sequences based on the task timestamp of each graph.
+    Returns two new dictionaries: masked_edge_index_by_depth and masked_list_sequences_by_depth.
+    """
+    # Prepare a tensor that maps each node to its graph's task timestamp
+    task_ts_per_node = batch.task_timestamp[batch.batch]
+
+    # Debug time mask
+    if debug_first_batch:
+            print("\n" + "="*60)
+            print("DEBUGGING TIME MASK ON THE FIRST BATCH")
+            print(f"Batch contains {batch.num_graphs} graphs. Analyzing Graph 0...")
+            graph_zero_task_ts = pd.to_datetime(batch.task_timestamp[0].item(), unit='s')
+            print(f"Graph 0 Task Timestamp: {graph_zero_task_ts}")
+            print("-" * 20)
+    # Debug time mask
+
+    # 1. Mask edges based on source node timestamps
+    masked_edge_index_by_depth = {}
+    for depth, edges in batch.edge_index_by_depth.items():
+        if not edges: continue
+        edge_index_tensor = torch.tensor(edges, dtype=torch.long, device=device).t()
+        source_nodes = edge_index_tensor[0]
+        
+        task_timestamps_for_edges = task_ts_per_node[source_nodes]
+        node_timestamps_for_edges = batch.node_timestamps[source_nodes]
+        
+        edge_mask = (node_timestamps_for_edges < task_timestamps_for_edges) | (node_timestamps_for_edges == -1)
+        # masked_edge_index_by_depth[depth] = edge_index_tensor[:, edge_mask].t().tolist()
+        masked_edges_tensor = edge_index_tensor[:, edge_mask]
+        
+    # Debug time mask
+        if debug_first_batch:
+            # Only count edges belonging to the first graph in the batch
+            is_graph_zero_edge = (batch.batch[source_nodes] == 0)
+            original_count = torch.sum(is_graph_zero_edge).item()
+            masked_count = torch.sum(is_graph_zero_edge & edge_mask).item()
+            if original_count > 0:
+                print(f"Edge Masking at Depth {depth}:")
+                print(f"  - Original Edges (Graph 0): {original_count}")
+                print(f"  - Edges After Mask (Graph 0): {masked_count}")
+                if masked_count < original_count:
+                    print(f"  ✅ SUCCESS: {original_count - masked_count} edge(s) were removed.")
+
+        masked_edge_index_by_depth[depth] = masked_edges_tensor.t().tolist()
+        
+    if debug_first_batch:
+        print("-" * 20)
+    # Debug time mask
+
+    # 2. Mask sequences by removing future nodes from them
+    masked_list_sequences_by_depth = {}
+    for depth, sequences in batch.list_index_sequences_by_depth.items():
+        if not sequences: continue
+        new_sequences_at_this_depth = []
+
+        # Debug sequence masking
+        if debug_first_batch:
+            original_seq_node_count = 0
+            masked_seq_node_count = 0
+        # Debug sequence masking
+
+        for seq_with_parent in sequences:
+            if len(seq_with_parent) < 2: 
+                continue
+
+            seq_nodes = torch.tensor(seq_with_parent[:-1], dtype=torch.long, device=device)
+            parent_node = seq_with_parent[-1]
+
+            is_graph_zero_seq = (batch.batch[parent_node] == 0) # Debug sequence masking
+            
+            graph_idx = batch.batch[parent_node]
+            task_ts = batch.task_timestamp[graph_idx]
+            
+            node_timestamps = batch.node_timestamps[seq_nodes]
+            node_mask = (node_timestamps < task_ts) | (node_timestamps == -1)
+            historical_seq_nodes = seq_nodes[node_mask]
+
+            # Debug sequence masking
+            if debug_first_batch and is_graph_zero_seq:
+                original_seq_node_count += len(seq_nodes)
+                masked_seq_node_count += len(historical_seq_nodes)
+            # Debug sequence masking
+
+            if len(historical_seq_nodes) > 0:
+                new_filtered_sequence = historical_seq_nodes.tolist() + [parent_node]
+                new_sequences_at_this_depth.append(new_filtered_sequence)
+
+        # Debug sequence masking
+        if debug_first_batch and original_seq_node_count > 0:
+            print(f"Sequence Masking at Depth {depth}:")
+            print(f"  - Original Sequence Nodes (Graph 0): {original_seq_node_count}")
+            print(f"  - Sequence Nodes After Mask (Graph 0): {masked_seq_node_count}")
+            if masked_seq_node_count < original_seq_node_count:
+                print(f"  ✅ SUCCESS: {original_seq_node_count - masked_seq_node_count} sequence node(s) were removed.")
+        # Debug sequence masking
+
+        if new_sequences_at_this_depth:
+            masked_list_sequences_by_depth[depth] = new_sequences_at_this_depth
+
+    # Debug sequence masking
+    if debug_first_batch:
+        print("="*60 + "\n")
+    # Debug sequence masking
+    return masked_edge_index_by_depth, masked_list_sequences_by_depth
+# <<< END NEW
+
+# >>> MODIFIED: Simplified to call the new apply_time_mask function
+def train_model(model, train_loader, optimizer, criterion, device, epoch):
+    """
+    Train the model for one epoch
+    """
+    model.train()
+    total_loss = 0
+    total_primary_loss = 0
+    total_orthogonal_loss = 0
+
+    if not train_loader:
+        return 0, 0, 0
+    progress_bar = tqdm(train_loader, desc=f"Training on {device}", unit="batch")
+
+    for batch_idx, batch in enumerate(progress_bar):
+        if batch is None: continue
+        batch = batch.to(device)
+        optimizer.zero_grad()
+
+        is_first_batch = (epoch == 0 and batch_idx == 0)
+
+        # Call the unified masking function
+        masked_edge_index_by_depth, masked_list_sequences_by_depth = apply_time_mask(batch, device, debug_first_batch=is_first_batch)
+
+        # Forward pass with the MASKED data
+        out = model(batch.x, masked_edge_index_by_depth, masked_list_sequences_by_depth, batch.batch)
+        
+        primary_loss = criterion(out, batch.y)
+        
+        orthogonal_loss = 0.0
+        if model.use_orthogonal_loss():
+            orthogonal_loss = model.get_orthogonal_loss()
+            total_loss_tensor = primary_loss + model.orthogonal_lambda * orthogonal_loss
+        else:
+            total_loss_tensor = primary_loss
+
+        total_loss_tensor.backward()
+        optimizer.step()
+        
+        total_loss += total_loss_tensor.item()
+        total_primary_loss += primary_loss.item()
+        if isinstance(orthogonal_loss, torch.Tensor):
+            total_orthogonal_loss += orthogonal_loss.item()
+    
+    avg_total_loss = total_loss / len(train_loader) if train_loader and len(train_loader) > 0 else 0
+    avg_primary_loss = total_primary_loss / len(train_loader) if train_loader and len(train_loader) > 0 else 0
+    avg_orthogonal_loss = total_orthogonal_loss / len(train_loader) if train_loader and len(train_loader) > 0 else 0
+    
+    return avg_total_loss, avg_primary_loss, avg_orthogonal_loss
+# <<< END MODIFIED
+
+def move_optimizer_to(optimizer, device):
+    """
+    Moves the state of an optimizer to a specified device.
+    """
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
+# >>> MODIFIED: Simplified to call the new apply_time_mask function
+def val_model(model, val_loader, device):
+    """
+    Validate the model using AUC score
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    progress_bar = tqdm(val_loader, desc="Validation", unit="batch")
+
+    with torch.no_grad():
+        for batch in progress_bar:
+            if batch is None: continue
+            batch = batch.to(device)
+            
+            # Call the unified masking function
+            masked_edge_index_by_depth, masked_list_sequences_by_depth = apply_time_mask(batch, device)
+            
+            out = model(batch.x, masked_edge_index_by_depth, masked_list_sequences_by_depth, batch.batch)
+            
+            probs = F.softmax(out, dim=1)[:, 1]
+            all_preds.extend(probs.cpu().numpy())
+            all_labels.extend(batch.y.cpu().numpy())
+            
+    if not all_labels: return np.array([]), np.array([])
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    
+    return all_preds,all_labels
+# <<< END MODIFIED
+
+# >>> MODIFIED: Simplified to call the new apply_time_mask function
+def test_model(model, test_loader, device):
+    """
+    Test the model using AUC score
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    progress_bar = tqdm(test_loader, desc="Testing", unit="batch")
+
+    with torch.no_grad():
+        for batch in progress_bar:
+            if batch is None: continue
+            batch = batch.to(device)
+
+            # Call the unified masking function
+            masked_edge_index_by_depth, masked_list_sequences_by_depth = apply_time_mask(batch, device)
+            
+            out = model(batch.x, masked_edge_index_by_depth, masked_list_sequences_by_depth, batch.batch)
+
+            probs = F.softmax(out, dim=1)[:, 1]
+            all_preds.extend(probs.cpu().numpy())
+            all_labels.extend(batch.y.cpu().numpy())
+
+    if not all_labels: return np.array([]), np.array([])
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    
+    return all_preds, all_labels
+# <<< END MODIFIED
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train a model on a preprocessed graph dataset.")
+    parser.add_argument('--processed_path', type=str, default='/home/dengyan/data/graph_dataset.pt', 
+                        help='Full path to the preprocessed graph dataset .pt file.')
+    parser.add_argument('--task_path', type=str, default='/home/dengyan/data/relbench/rel-f1/tasks/driver-dnf/',
+                        help='Full path to the directory containing train/val/test.parquet task files.')
+    parser.add_argument('--dataset_id_key', type=str, default='driverId',
+                        help="The entity ID key used when CREATING the graph dataset (e.g., 'driverId').")
+    parser.add_argument('--task_id_key', type=str, default='driverId',
+                        help="The entity ID key used in the TASK parquet files (e.g., 'UserId').")
+    parser.add_argument('--label_key', type=str, default='did_not_finish',
+                        help="The column name for the label in the task files (e.g., 'did_not_finish').")
+    parser.add_argument('--timestamp_key', type=str, default='timestamp', 
+                        help="The column name for the timestamp in the task files.")
+    parser.add_argument('--batch_size', type=int, default=16, 
+                        help="Batch size for training and evaluation.")
+    parser.add_argument('--gpu_ids', type=str, default='0',
+                        help="Comma-separated list of GPU IDs to use (e.g., '0,1,2').")
+    parser.add_argument("--node_threshold", type=int, default=50000,
+                        help="Threshold for the maximum number of nodes in a graph. Graphs exceeding this will be trained on cpu.")
+    parser.add_argument('--seed', type=int, default=42,
+                        help="Random seed for reproducibility.")
+    args = parser.parse_args()
+
+    seed_everything(args.seed)
+    # 1. Load the pre-processed "pure" graph dataset
+    full_dataset = load_dataset(args.processed_path)
+    gpu_device = torch.device(f'cuda:{args.gpu_ids}' if torch.cuda.is_available() else 'cpu')
+    cpu_device = torch.device('cpu')
+    # 2. Automatically detect entity ID key and create a lookup map
+    if not full_dataset:
+        raise ValueError("Graph dataset is empty.")
+    
+    first_data = full_dataset[0]
+    print(first_data)
+    entity_key = args.dataset_id_key
+    if entity_key is None:
+        raise AttributeError("Graphs in dataset must have a known entity ID attribute (e.g., 'driverId', 'customer_id').")
+        
+    small_graphs = [data for data in full_dataset if data.num_nodes <= args.node_threshold]
+    large_graphs = [data for data in full_dataset if data.num_nodes > args.node_threshold]
+    small_graph_map = {getattr(data, 'entity_id'): data for data in small_graphs}
+    large_graph_map = {getattr(data, 'entity_id'): data for data in large_graphs}
+    print(f"\nCreated a graph map with {len(small_graph_map)+len(large_graph_map)} entries using key '{entity_key}'.")
+    
+    # 3. Load the actual relbench task files
+    # This example uses the 'rel-f1/driver-dnf' task.
+    # Modify this path for other datasets/tasks.
+    # base_task_path = os.path.expanduser('~/.cache/relbench/rel-f1/tasks/driver-dnf/')
+    base_task_path = os.path.expanduser(args.task_path)
+    train_path = os.path.join(base_task_path, 'train.parquet')
+    val_path = os.path.join(base_task_path, 'val.parquet')
+    test_path = os.path.join(base_task_path, 'test.parquet')
+
+    print(f"\nLoading tasks from: {base_task_path}")
+    try:
+        train_tasks = pd.read_parquet(train_path)
+        val_tasks = pd.read_parquet(val_path)
+        test_tasks = pd.read_parquet(test_path)
+        print("Successfully loaded train, val, and test task files.")
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"Task file not found at {e.filename}. Please ensure you have downloaded the correct relbench task data.")
+
+    # 4. Define the column name configuration for the current task
+    task_config = {
+        'entity_id_col': args.task_id_key,
+        'label_col': args.label_key,
+        'timestamp_col': args.timestamp_key
+    }
+    
+    # 5. Create Dataloaders
+    batch_size = args.batch_size
+    print("\nCreating dataloaders for small graphs")
+    s_train_loader, s_val_loader, s_test_loader = create_dataloaders(
+        train_tasks, val_tasks, test_tasks, small_graph_map, task_config, batch_size=batch_size
+    )
+    print("\nCreating dataloaders for large graphs")
+    l_train_loader, l_val_loader, l_test_loader = create_dataloaders(
+        train_tasks, val_tasks, test_tasks, large_graph_map, task_config, batch_size=batch_size
+    )
+
+    # 6. Initialize Model, Optimizer, etc.
+    in_channels = full_dataset[0].num_node_features
+    hidden_channels = 64
+    num_classes = 2
+    num_heads = 8
+    ssagg_lambda = 1.5
+    dropout = 0.5
+    orthogonal_lambda = 0.1
+
+    
+    model = Model(
+        in_channels=in_channels, 
+        hidden_channels=hidden_channels, 
+        num_heads=num_heads,
+        num_classes=num_classes,
+        ssagg_lambda=ssagg_lambda,
+        dropout=dropout,
+        orthogonal_lambda=orthogonal_lambda
+    )
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = torch.nn.CrossEntropyLoss()
+    
+    print(f"\nModel: {model}")
+    print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+    
+    # 7. Training loop
+    num_epochs = 5
+    print(f"\nTraining for {num_epochs} epochs...")
+    
+    # record best validation and test AUCs
+    epoch_details = []
+    best_val_auc = 0.0
+    best_test_auc = 0.0
+    best_train_loss = float('inf')
+    best_primary_loss = float('inf')
+    best_orthogonal_loss = float('inf')
+
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        # Train on small graphs
+        model.to(gpu_device)
+        move_optimizer_to(optimizer, gpu_device)
+        train_loss_s, primary_loss_s, orthogonal_loss_s = train_model(model, s_train_loader, optimizer, criterion, gpu_device, epoch=epoch)
+
+        model.to(cpu_device)
+        move_optimizer_to(optimizer, cpu_device)
+        train_loss_l, primary_loss_l, orthogonal_loss_l = train_model(model, l_train_loader, optimizer, criterion, cpu_device, epoch=epoch)
+
+        train_loss = (train_loss_s + train_loss_l)
+        primary_loss = (primary_loss_s + primary_loss_l)
+        orthogonal_loss = (orthogonal_loss_s + orthogonal_loss_l)
+        # Validate on small graphs
+        model.to(gpu_device)
+        val_preds_s, val_labels_s = val_model(model, s_val_loader, gpu_device)
+
+        model.to(cpu_device)
+        val_preds_l, val_labels_l = val_model(model, l_val_loader, cpu_device)
+        all_val_preds = np.concatenate([val_preds_s, val_preds_l])
+        all_val_labels = np.concatenate([val_labels_s, val_labels_l])
+        val_auc = roc_auc_score(all_val_labels, all_val_preds)
+
+        # Test on small graphs
+        model.to(gpu_device)
+        test_preds_s, test_labels_s = test_model(model, s_test_loader, gpu_device)
+        model.to(cpu_device)
+        test_preds_l, test_labels_l = test_model(model, l_test_loader, cpu_device)
+        all_test_preds = np.concatenate([test_preds_s, test_preds_l])
+        all_test_labels = np.concatenate([test_labels_s, test_labels_l])
+        test_auc = roc_auc_score(all_test_labels, all_test_preds)
+        
+        print(f"Epoch {epoch+1} Results -> Train Loss: {train_loss:.4f} (Primary: {primary_loss:.4f}, Orthogonal: {orthogonal_loss:.6f}), "
+              f"Val AUC: {val_auc:.4f}, Test AUC: {test_auc:.4f}")
+
+        epoch_details.append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'primary_loss': primary_loss,
+            'orthogonal_loss': orthogonal_loss,
+            'val_auc': val_auc,
+            'test_auc': test_auc
+        })
+        # Update best AUCs
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+        if test_auc > best_test_auc:
+            best_test_auc = test_auc
+        if train_loss < best_train_loss:
+            best_train_loss = train_loss
+        if primary_loss < best_primary_loss:
+            best_primary_loss = primary_loss    
+        if orthogonal_loss < best_orthogonal_loss:
+            best_orthogonal_loss = orthogonal_loss
+
+    print("model hyperparameters:")
+    print(f"  in_channels: {in_channels}")
+    print(f"  hidden_channels: {hidden_channels}")
+    print(f"  num_classes: {num_classes}")
+    print(f"  num_heads: {num_heads}")
+    print(f"  ssagg_lambda: {ssagg_lambda}")
+    print(f"  dropout: {dropout}")
+    print(f"  orthogonal_lambda: {orthogonal_lambda}")
+
+    print("\nTraining complete. Final results:")
+    for detail in epoch_details:
+        print(f"Epoch {detail['epoch']}: Train Loss: {detail['train_loss']:.4f}, "
+              f"Primary Loss: {detail['primary_loss']:.4f}, Orthogonal Loss: {detail['orthogonal_loss']:.6f}, "
+              f"Val AUC: {detail['val_auc']:.4f}, Test AUC: {detail['test_auc']:.4f}")
+    print(f"\nBest Validation AUC: {best_val_auc:.4f}")
+    print(f"Best Test AUC: {best_test_auc:.4f}")
+    print(f"Best Train Loss: {best_train_loss:.4f}")    
+    print(f"Best Primary Loss: {best_primary_loss:.4f}")
+    print(f"Best Orthogonal Loss: {best_orthogonal_loss:.6f}")
+ 
