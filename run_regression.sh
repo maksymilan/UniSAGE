@@ -3,7 +3,8 @@
 #
 # Description:
 #   This script automates the training for all predefined regression tasks.
-#   It now binds the training process to specific CPU cores to manage resources.
+#   It now binds the training process to specific CPU cores and uses
+#   configurable hyperparameters.
 #
 # Usage:
 #   ./run_training_regression.sh
@@ -11,16 +12,24 @@
 
 # --- Configuration ---
 
-# Path to your Python script for regression training.
 TRAIN_SCRIPT="train_regression.py"
-
-# Root directory for all preprocessed and sampled data.
 DATA_ROOT="${HOME}/relbench-data-pt"
 TASK_DATA_ROOT="${HOME}/relbench-data-test/sampling"
-
 CPU_CORES_TO_USE="10-19"
 
-# List of all regression tasks to be trained.
+# --- Hyperparameter Configuration ---
+EPOCHS=10
+BATCH_SIZE=2
+LEARNING_RATE=0.001
+HIDDEN_CHANNELS=64
+NUM_HEADS=2
+SSAGG_LAMBDA=1.5
+DROPOUT=0.3
+ORTHOGONAL_LAMBDA=0.1
+GPU_IDS=2
+SEED=42
+
+# --- Task List ---
 TASKS=(
     "rel-amazon/tasks/user-ltv"
     "rel-amazon/tasks/item-ltv"
@@ -34,7 +43,6 @@ TASKS=(
 
 # --- Task Metadata Configuration ---
 
-# DATASET_ID_KEY: The entity ID key used in the preprocessed .pt graph files.
 declare -A DATASET_ID_KEYS=(
     ["rel-amazon/tasks/user-ltv"]="customer_id"
     ["rel-amazon/tasks/item-ltv"]="product_id"
@@ -46,7 +54,6 @@ declare -A DATASET_ID_KEYS=(
     ["rel-trial/tasks/study-adverse"]="nct_id"
 )
 
-# TASK_ID_KEY: The entity ID key used in the task's .parquet files.
 declare -A TASK_ID_KEYS=(
     ["rel-amazon/tasks/user-ltv"]="customer_id"
     ["rel-amazon/tasks/item-ltv"]="product_id"
@@ -58,7 +65,6 @@ declare -A TASK_ID_KEYS=(
     ["rel-trial/tasks/study-adverse"]="nct_id"
 )
 
-# LABEL_KEY: The column name of the target label in the task's .parquet files.
 declare -A LABEL_KEYS=(
     ["rel-amazon/tasks/user-ltv"]="ltv"
     ["rel-amazon/tasks/item-ltv"]="ltv"
@@ -70,7 +76,6 @@ declare -A LABEL_KEYS=(
     ["rel-trial/tasks/study-adverse"]="num_of_adverse_events"
 )
 
-# TIMESTAMP_KEY: The column name of the timestamp in the task's .parquet files.
 declare -A TIMESTAMP_KEYS=(
     ["rel-amazon/tasks/user-ltv"]="timestamp"
     ["rel-amazon/tasks/item-ltv"]="timestamp"
@@ -114,10 +119,6 @@ for task in "${TASKS[@]}"; do
     echo "  - Processed data: ${processed_path}"
     echo "  - Task files dir: ${task_path}"
     echo "  - Log file:       ${log_file}"
-    echo "  - Dataset ID key: ${dataset_id_key}"
-    echo "  - Task ID key:    ${task_id_key}"
-    echo "  - Label key:      ${label_key}"
-    echo "  - Timestamp key:  ${timestamp_key}"
 
     if [ ! -f "$processed_path" ]; then
         echo "Error: Preprocessed file not found: '${processed_path}'. Please run preprocessing first. Skipping."
@@ -131,9 +132,16 @@ for task in "${TASKS[@]}"; do
         --task_id_key \"${task_id_key}\" \
         --label_key \"${label_key}\" \
         --timestamp_key \"${timestamp_key}\" \
-        --batch_size 1 \
-        --gpu_ids 0 \
-        --seed 42"
+        --gpu_ids ${GPU_IDS} \
+        --seed ${SEED} \
+        --epochs ${EPOCHS} \
+        --batch_size ${BATCH_SIZE} \
+        --lr ${LEARNING_RATE} \
+        --hidden_channels ${HIDDEN_CHANNELS} \
+        --num_heads ${NUM_HEADS} \
+        --ssagg_lambda ${SSAGG_LAMBDA} \
+        --dropout ${DROPOUT} \
+        --orthogonal_lambda ${ORTHOGONAL_LAMBDA}"
 
     echo
     echo "Executing command:"

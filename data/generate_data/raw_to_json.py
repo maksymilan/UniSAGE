@@ -1,10 +1,6 @@
-# build_json.py
-# A unified, parameter-driven script to build nested JSONL files from various relational datasets.
-# Final version with all 7 builders fully implemented and support for custom I/O paths.
-
 import pandas as pd
 from pathlib import Path
-import orjson  # Using orjson for better performance on large datasets
+import orjson
 import argparse
 from typing import Dict, Any, List, Iterator, Optional
 from pandas import Timestamp
@@ -12,17 +8,10 @@ import numpy as np
 from tqdm import tqdm
 import warnings
 
-# --- Global Settings & Warnings ---
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
-pd.options.mode.chained_assignment = None  # default='warn'
-
-# --- Utility Functions ---
+pd.options.mode.chained_assignment = None
 
 def make_json_serializable(obj: Any) -> Any:
-    """
-    Recursively convert non-JSON serializable types to compatible formats.
-    Handles pandas/numpy data types and NaT/NaN values robustly.
-    """
     if isinstance(obj, dict):
         return {k: make_json_serializable(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -38,9 +27,6 @@ def make_json_serializable(obj: Any) -> Any:
     return obj
 
 def save_to_jsonl(records: Iterator[Dict], output_path: Path):
-    """
-    Stream records to a JSONL file, showing progress.
-    """
     print(f"\nStreaming records to JSONL file: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -55,18 +41,11 @@ def save_to_jsonl(records: Iterator[Dict], output_path: Path):
 
     print(f"Successfully saved {count} records to {output_path}")
 
-# --- Base Builder Class ---
-
 class BaseBuilder:
-    """
-    Abstract base class for database-specific JSON builders.
-    Now supports custom input and output paths.
-    """
     def __init__(self, db_name: str, root_entity: str, db_path: Optional[str] = None, output_dir: Optional[str] = None):
         self.db_name = db_name
         self.root_entity = root_entity
 
-        # --- PATH LOGIC: Use custom path if provided, otherwise use default ---
         if db_path:
             self.db_path = Path(db_path)
         else:
@@ -76,7 +55,6 @@ class BaseBuilder:
             self.output_dir = Path(output_dir)
         else:
             self.output_dir = Path.home() / f"relbench-data/{self.db_name}"
-        # --- END OF PATH LOGIC ---
 
         self.prepared_data = None
         
@@ -88,15 +66,12 @@ class BaseBuilder:
             print(f"WARNING: Database path does not exist: {self.db_path}")
 
     def load_and_prepare_data(self):
-        """Load and preprocess data. Must be implemented by subclasses."""
         raise NotImplementedError
 
     def build_trees(self) -> Iterator[Dict]:
-        """Build the nested dictionary for each root entity. Must be implemented by subclasses."""
         raise NotImplementedError
 
     def run(self):
-        """Execute the full pipeline: prepare, build, and save."""
         print(f"\n--- Starting data preparation for {self.db_name} ---")
         self.load_and_prepare_data()
         if self.prepared_data is None:
@@ -106,13 +81,8 @@ class BaseBuilder:
         print(f"\n--- Starting tree construction for root entity: {self.root_entity} ---")
         trees_iterator = self.build_trees()
 
-        # The output filename is now constructed based on the final output_dir
         output_file = self.output_dir / f"{self.db_name}-{self.root_entity}.jsonl"
         save_to_jsonl(trees_iterator, output_file)
-
-# --- Database-Specific Builders (Alphabetical Order & Fully Implemented) ---
-# Note: The internal logic of these classes does not need to change, as they
-#       rely on self.db_path which is set correctly in the BaseBuilder.
 
 class AmazonBuilder(BaseBuilder):
     def load_and_prepare_data(self):
@@ -620,15 +590,11 @@ class StackBuilder(BaseBuilder):
         print("Building user trees using two-stage vectorized aggregation...")
         users_df = self.prepared_data['users'].copy()
         
-        # Stage 1: Get aggregated posts dataframe
         posts_agg_df = self._get_aggregated_posts_df()
 
-        # Stage 2: Aggregate posts and other children to users
-        # Aggregate posts to users
         posts_by_user = posts_agg_df.groupby('UserId').apply(self._aggregate_to_list).rename('posts')
         users_df = users_df.merge(posts_by_user, on='UserId', how='left')
         
-        # Aggregate other direct children to users
         user_children = {
             'badges': ('UserId', self.prepared_data['badges']),
             'user_comments': ('CommenterUserId', self.prepared_data['comments']),
@@ -654,7 +620,6 @@ class StackBuilder(BaseBuilder):
                 aggregated = df.groupby(key).apply(self._aggregate_to_list).rename(name)
                 posts_df = posts_df.merge(aggregated, on=key, how='left')
         
-        # Enrich with owner info after all aggregations to avoid column conflicts
         posts_df = pd.merge(posts_df, self.prepared_data['users'].add_suffix('_owner'), left_on='UserId', right_on='UserId_owner', how='left')
         return posts_df
 
@@ -737,9 +702,6 @@ class TrialBuilder(BaseBuilder):
 
         return study_node
 
-
-# --- Dispatcher ---
-
 BUILDER_REGISTRY = {
     'rel-amazon': AmazonBuilder,
     'rel-avito': AvitoBuilder,
@@ -750,10 +712,7 @@ BUILDER_REGISTRY = {
     'rel-trial': TrialBuilder,
 }
 
-# --- Main Execution ---
-
 def main():
-    """Main function to parse arguments and run the specified builder."""
     parser = argparse.ArgumentParser(
         description="Unified JSON builder for relational datasets.",
         formatter_class=argparse.RawTextHelpFormatter
@@ -762,12 +721,14 @@ def main():
                         help="The name of the database to process.")
     parser.add_argument("root_entity", type=str,
                         help="The root entity for building the JSON trees (e.g., 'user', 'post', 'study').")
-    parser.add_argument("--db_path", type=str, default=Path.home() / f".cache/relbench/{parser.parse_args().db_name}/db",
-                        help="Custom path to the database directory (e.g., './my_data/rel-amazon/db').\n"
-                             "If not provided, defaults to '~/.cache/relbench/{db_name}/db'.")
-    parser.add_argument("--output_dir", type=str, default=Path.home() / f"relbench-data-test/{parser.parse_args().db_name}",
-                        help="Custom path to the output directory (e.g., './my_output').\n"
-                             "If not provided, defaults to '~/relbench-data/{db_name}'.")
+    
+    # We need to parse once just to get the db_name for the default paths
+    temp_args, _ = parser.parse_known_args()
+
+    parser.add_argument("--db_path", type=str, default=Path.home() / f".cache/relbench/{temp_args.db_name}/db",
+                        help="Custom path to the database directory.")
+    parser.add_argument("--output_dir", type=str, default=Path.home() / f"relbench-data/{temp_args.db_name}",
+                        help="Custom path to the output directory.")
     
     args = parser.parse_args()
     builder_class = BUILDER_REGISTRY.get(args.db_name)
@@ -777,7 +738,6 @@ def main():
         return
 
     try:
-        # Pass all arguments to the builder's constructor
         builder = builder_class(
             db_name=args.db_name,
             root_entity=args.root_entity,
@@ -789,8 +749,6 @@ def main():
         print(f"Configuration Error: {e}")
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
-        # For debugging, you might want to re-raise the exception:
-        # raise
 
 if __name__ == "__main__":
     main()

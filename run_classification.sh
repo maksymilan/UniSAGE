@@ -2,8 +2,10 @@
 #           Automated Training Script for Classification Tasks
 #
 # Description:
-#   This script automates the training for all predefined classification tasks.
-#   It now binds the training process to specific CPU cores to manage resources.
+#   This script automates the training process for all predefined RelBench
+#   classification (AUROC) tasks. It uses configuration maps to supply the
+#   correct parameters to the Python training script for each task. It also
+#   binds the training process to specific CPU cores to manage resources.
 #
 # Usage:
 #   ./run_training_classification.sh
@@ -14,15 +16,31 @@
 # Path to your Python script for classification training.
 TRAIN_SCRIPT="train_classification.py"
 
-# Root directory for all preprocessed and sampled data.
+# Root directory for the final processed .pt files.
 DATA_ROOT="${HOME}/relbench-data-pt"
+
+# Root directory for the sampled train/val/test.parquet task files.
 TASK_DATA_ROOT="${HOME}/relbench-data-test/sampling"
 
-CPU_CORES_TO_USE="0-9"
+# Define the CPU cores to which the training script will be bound.
+CPU_CORES_TO_USE="10-19"
 
+# --- Hyperparameter Configuration ---
+EPOCHS=10
+BATCH_SIZE=4
+LEARNING_RATE=0.001
+HIDDEN_CHANNELS=64
+NUM_HEADS=8
+SSAGG_LAMBDA=1.5
+DROPOUT=0.5
+ORTHOGONAL_LAMBDA=0.1
+GPU_IDS=3
+SEED=42
+
+# --- Task List ---
 TASKS=(
     "rel-amazon/tasks/user-churn"
-    "rel-amazon/tasks/item-churn" 
+    "rel-amazon/tasks/item-churn"
     "rel-avito/tasks/user-clicks"
     "rel-avito/tasks/user-visits"
     "rel-event/tasks/user-repeat"
@@ -37,10 +55,9 @@ TASKS=(
 
 # --- Task Metadata Configuration ---
 
-# DATASET_ID_KEY: The entity ID key used in the preprocessed .pt graph files.
 declare -A DATASET_ID_KEYS=(
     ["rel-amazon/tasks/user-churn"]="customer_id"
-    ["rel-amazon/tasks/item-churn"]="product_id" 
+    ["rel-amazon/tasks/item-churn"]="product_id"
     ["rel-avito/tasks/user-clicks"]="UserID"
     ["rel-avito/tasks/user-visits"]="UserID"
     ["rel-event/tasks/user-repeat"]="user_id"
@@ -53,10 +70,9 @@ declare -A DATASET_ID_KEYS=(
     ["rel-trial/tasks/study-outcome"]="nct_id"
 )
 
-# TASK_ID_KEY: The entity ID key used in the task's .parquet files.
 declare -A TASK_ID_KEYS=(
     ["rel-amazon/tasks/user-churn"]="customer_id"
-    ["rel-amazon/tasks/item-churn"]="product_id" 
+    ["rel-amazon/tasks/item-churn"]="product_id"
     ["rel-avito/tasks/user-clicks"]="UserID"
     ["rel-avito/tasks/user-visits"]="UserID"
     ["rel-event/tasks/user-repeat"]="user"
@@ -69,10 +85,9 @@ declare -A TASK_ID_KEYS=(
     ["rel-trial/tasks/study-outcome"]="nct_id"
 )
 
-# LABEL_KEY: The column name of the target label in the task's .parquet files.
 declare -A LABEL_KEYS=(
     ["rel-amazon/tasks/user-churn"]="churn"
-    ["rel-amazon/tasks/item-churn"]="churn" 
+    ["rel-amazon/tasks/item-churn"]="churn"
     ["rel-avito/tasks/user-clicks"]="num_click"
     ["rel-avito/tasks/user-visits"]="num_click"
     ["rel-event/tasks/user-repeat"]="target"
@@ -85,10 +100,9 @@ declare -A LABEL_KEYS=(
     ["rel-trial/tasks/study-outcome"]="outcome"
 )
 
-# TIMESTAMP_KEY: The column name of the timestamp in the task's .parquet files.
 declare -A TIMESTAMP_KEYS=(
     ["rel-amazon/tasks/user-churn"]="timestamp"
-    ["rel-amazon/tasks/item-churn"]="timestamp" 
+    ["rel-amazon/tasks/item-churn"]="timestamp"
     ["rel-avito/tasks/user-clicks"]="timestamp"
     ["rel-avito/tasks/user-visits"]="timestamp"
     ["rel-event/tasks/user-repeat"]="timestamp"
@@ -133,10 +147,6 @@ for task in "${TASKS[@]}"; do
     echo "  - Processed data: ${processed_path}"
     echo "  - Task files dir: ${task_path}"
     echo "  - Log file:       ${log_file}"
-    echo "  - Dataset ID key: ${dataset_id_key}"
-    echo "  - Task ID key:    ${task_id_key}"
-    echo "  - Label key:      ${label_key}"
-    echo "  - Timestamp key:  ${timestamp_key}"
 
     if [ ! -f "$processed_path" ]; then
         echo "Error: Preprocessed file not found: '${processed_path}'. Please run preprocessing first. Skipping."
@@ -150,9 +160,16 @@ for task in "${TASKS[@]}"; do
         --task_id_key \"${task_id_key}\" \
         --label_key \"${label_key}\" \
         --timestamp_key \"${timestamp_key}\" \
-        --batch_size 1 \
-        --gpu_ids 0 \
-        --seed 42"
+        --gpu_ids ${GPU_IDS} \
+        --seed ${SEED} \
+        --epochs ${EPOCHS} \
+        --batch_size ${BATCH_SIZE} \
+        --lr ${LEARNING_RATE} \
+        --hidden_channels ${HIDDEN_CHANNELS} \
+        --num_heads ${NUM_HEADS} \
+        --ssagg_lambda ${SSAGG_LAMBDA} \
+        --dropout ${DROPOUT} \
+        --orthogonal_lambda ${ORTHOGONAL_LAMBDA}"
 
     echo
     echo "Executing command:"
