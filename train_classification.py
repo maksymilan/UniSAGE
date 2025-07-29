@@ -8,15 +8,12 @@ from torch.utils.data import DataLoader
 from torch_geometric.data import Data, Batch
 from torch_geometric.seed import seed_everything
 from model.UniSAGE import UniSAGE
-from sklearn.metrics import roc_auc_score, mean_absolute_error
+from sklearn.metrics import roc_auc_score
 import numpy as np
 from tqdm import tqdm
 import argparse
 
 def load_dataset(processed_path):
-    """
-    Load the saved dataset
-    """
     dataset_path = processed_path
     print(f"Loading preprocessed graph data from: {dataset_path}")
 
@@ -44,10 +41,6 @@ def load_dataset(processed_path):
 
 
 class TaskDataset(Dataset):
-    """
-    A PyTorch Dataset that combines a task file (e.g., from a CSV or Parquet)
-    with a pre-processed graph map.
-    """
     def __init__(self, task_df: pd.DataFrame, graph_map: dict, config: dict):
         self.tasks = task_df
         self.graph_map = graph_map
@@ -72,7 +65,7 @@ class TaskDataset(Dataset):
         data = full_graph.clone()
         
         label_value = task_row[self.label_col]
-        data.y = torch.tensor([float(label_value)], dtype=torch.float)
+        data.y = torch.tensor([int(label_value)], dtype=torch.long)
 
         task_timestamp = pd.to_datetime(task_row[self.timestamp_col])
         data.task_timestamp = torch.tensor([int(task_timestamp.timestamp())], dtype=torch.long)
@@ -80,12 +73,6 @@ class TaskDataset(Dataset):
         return data
 
 def custom_collate(batch):
-    """
-    Custom collate function to properly handle edge_index_by_depth and list_index_sequences_by_depth
-    when batching graphs together. Updates node indices correctly.
-    This version avoids the default collate function's issues with dictionary attributes
-    that have varying keys across data objects.
-    """
     batch_for_default_collate = []
     for data in batch:
         new_data = Data()
@@ -128,9 +115,7 @@ def custom_collate(batch):
     
     return batch_data
 
-
 def custom_collate_safe(batch):
-    """A safe wrapper for the collate function that filters out None values."""
     batch = [item for item in batch if item is not None]
     if not batch:
         return None
@@ -138,7 +123,6 @@ def custom_collate_safe(batch):
 
 
 def create_dataloaders(train_tasks, val_tasks, test_tasks, graph_map, task_config, batch_size=4):
-    """Creates dataloaders from task DataFrames and a graph map."""
     train_dataset = TaskDataset(train_tasks, graph_map, task_config)
     val_dataset = TaskDataset(val_tasks, graph_map, task_config)
     test_dataset = TaskDataset(test_tasks, graph_map, task_config)
@@ -156,14 +140,14 @@ def create_dataloaders(train_tasks, val_tasks, test_tasks, graph_map, task_confi
 
 
 class Model(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, num_heads=4, ssagg_lambda=1.0, dropout=0.3, orthogonal_lambda=0.1):
+    def __init__(self, in_channels, hidden_channels, num_classes,num_heads=4, ssagg_lambda=1.0, dropout=0.3, orthogonal_lambda=0.1):
         super(Model, self).__init__()
         self.orthogonal_lambda = orthogonal_lambda
         
         self.unisage = UniSAGE(
             in_channels=in_channels, 
+            out_channels=num_classes,
             num_heads=num_heads,
-            out_channels=1,
             hidden_channels=hidden_channels,
             ssagg_lambda=ssagg_lambda,
             dropout=dropout,
@@ -197,11 +181,6 @@ class Model(torch.nn.Module):
             self.unisage.reset_parameters()
 
 def apply_time_mask(batch, device, debug_first_batch=False):
-    """
-    Applies time masking to a batch of graphs.
-    Filters edges and sequences based on the task timestamp of each graph.
-    Returns two new dictionaries: masked_edge_index_by_depth and masked_list_sequences_by_depth.
-    """
     task_ts_per_node = batch.task_timestamp[batch.batch]
 
     if debug_first_batch:
@@ -287,9 +266,6 @@ def apply_time_mask(batch, device, debug_first_batch=False):
     return masked_edge_index_by_depth, masked_list_sequences_by_depth
 
 def train_model(model, train_loader, optimizer, criterion, device, epoch):
-    """
-    Train the model for one epoch
-    """
     model.train()
     total_loss = 0
     total_primary_loss = 0
@@ -305,12 +281,12 @@ def train_model(model, train_loader, optimizer, criterion, device, epoch):
         optimizer.zero_grad()
 
         is_first_batch = (epoch == 0 and batch_idx == 0)
+
         masked_edge_index_by_depth, masked_list_sequences_by_depth = apply_time_mask(batch, device, debug_first_batch=is_first_batch)
         out = model(batch.x, masked_edge_index_by_depth, masked_list_sequences_by_depth, batch.batch)
         
-        target = batch.y.view_as(out)
-        primary_loss = criterion(out, target)
-
+        primary_loss = criterion(out, batch.y)
+        
         orthogonal_loss = 0.0
         if model.use_orthogonal_loss():
             orthogonal_loss = model.get_orthogonal_loss()
@@ -333,18 +309,12 @@ def train_model(model, train_loader, optimizer, criterion, device, epoch):
     return avg_total_loss, avg_primary_loss, avg_orthogonal_loss
 
 def move_optimizer_to(optimizer, device):
-    """
-    Moves the state of an optimizer to a specified device.
-    """
     for state in optimizer.state.values():
         for k, v in state.items():
             if torch.is_tensor(v):
                 state[k] = v.to(device)
 
-def val_model(model, val_loader, device, clamp_min: float, clamp_max: float):
-    """
-    Validate the model using MAE score
-    """
+def val_model(model, val_loader, device):
     model.eval()
     all_preds = []
     all_labels = []
@@ -360,20 +330,17 @@ def val_model(model, val_loader, device, clamp_min: float, clamp_max: float):
             
             out = model(batch.x, masked_edge_index_by_depth, masked_list_sequences_by_depth, batch.batch)
             
-            pred = torch.clamp(out, min=clamp_min, max=clamp_max)
-            all_preds.extend(np.atleast_1d(pred.squeeze().cpu().numpy()))
-            all_labels.extend(np.atleast_1d(batch.y.squeeze().cpu().numpy()))
-
+            probs = F.softmax(out, dim=1)[:, 1]
+            all_preds.extend(probs.cpu().numpy())
+            all_labels.extend(batch.y.cpu().numpy())
+            
     if not all_labels: return np.array([]), np.array([])
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     
     return all_preds,all_labels
 
-def test_model(model, test_loader, device, clamp_min: float, clamp_max: float):
-    """
-    Test the model using MAE score
-    """
+def test_model(model, test_loader, device):
     model.eval()
     all_preds = []
     all_labels = []
@@ -389,9 +356,9 @@ def test_model(model, test_loader, device, clamp_min: float, clamp_max: float):
             
             out = model(batch.x, masked_edge_index_by_depth, masked_list_sequences_by_depth, batch.batch)
 
-            pred = torch.clamp(out, min=clamp_min, max=clamp_max)
-            all_preds.extend(np.atleast_1d(pred.squeeze().cpu().numpy()))
-            all_labels.extend(np.atleast_1d(batch.y.squeeze().cpu().numpy()))
+            probs = F.softmax(out, dim=1)[:, 1]
+            all_preds.extend(probs.cpu().numpy())
+            all_labels.extend(batch.y.cpu().numpy())
 
     if not all_labels: return np.array([]), np.array([])
     all_preds = np.array(all_preds)
@@ -410,8 +377,7 @@ if __name__ == "__main__":
     parser.add_argument('--gpu_ids', type=str, default='0', help="Comma-separated list of GPU IDs to use (e.g., '0,1,2').")
     parser.add_argument("--node_threshold", type=int, default=50000, help="Threshold for the maximum number of nodes in a graph. Graphs exceeding this will be trained on cpu.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
-
-    # Hyperparameter Arguments
+    
     parser.add_argument('--epochs', type=int, default=5, help="Number of training epochs.")
     parser.add_argument('--batch_size', type=int, default=16, help="Batch size for training and evaluation.")
     parser.add_argument('--lr', type=float, default=0.001, help="Learning rate for the optimizer.")
@@ -424,11 +390,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     seed_everything(args.seed)
-
+    
     full_dataset = load_dataset(args.processed_path)
     gpu_device = torch.device(f'cuda:{args.gpu_ids}' if torch.cuda.is_available() else 'cpu')
     cpu_device = torch.device('cpu')
-
+    
     if not full_dataset:
         raise ValueError("Graph dataset is empty.")
     
@@ -463,10 +429,7 @@ if __name__ == "__main__":
         'label_col': args.label_key,
         'timestamp_col': args.timestamp_key
     }
-
-    train_target_values = train_tasks[task_config['label_col']].to_numpy()
-    clamp_min, clamp_max = np.percentile(train_target_values, [2, 98])
-
+    
     print("\nCreating dataloaders for small graphs")
     s_train_loader, s_val_loader, s_test_loader = create_dataloaders(
         train_tasks, val_tasks, test_tasks, small_graph_map, task_config, batch_size=args.batch_size
@@ -477,10 +440,12 @@ if __name__ == "__main__":
     )
 
     in_channels = full_dataset[0].num_node_features
-    
+    num_classes = 2
+
     model = Model(
         in_channels=in_channels, 
         hidden_channels=args.hidden_channels, 
+        num_classes=num_classes,
         num_heads=args.num_heads,
         ssagg_lambda=args.ssagg_lambda,
         dropout=args.dropout,
@@ -488,15 +453,19 @@ if __name__ == "__main__":
     )
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = torch.nn.L1Loss() 
+    criterion = torch.nn.CrossEntropyLoss()
     
     print(f"\nModel: {model}")
     print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
     
     print(f"\nTraining for {args.epochs} epochs...")
-
-    best_val_mae = float('inf')
-    best_test_mae = float('inf')
+    
+    epoch_details = []
+    best_val_auc = 0.0
+    best_test_auc = 0.0
+    best_train_loss = float('inf')
+    best_primary_loss = float('inf')
+    best_orthogonal_loss = float('inf')
 
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
@@ -514,27 +483,82 @@ if __name__ == "__main__":
         orthogonal_loss = (orthogonal_loss_s + orthogonal_loss_l)
         
         model.to(gpu_device)
-        val_preds_s, val_labels_s = val_model(model, s_val_loader, gpu_device, clamp_min, clamp_max)
+        val_preds_s, val_labels_s = val_model(model, s_val_loader, gpu_device)
+
         model.to(cpu_device)
-        val_preds_l, val_labels_l = val_model(model, l_val_loader, cpu_device, clamp_min, clamp_max)
-        all_val_preds = np.concatenate([val_preds_s, val_preds_l])
-        all_val_labels = np.concatenate([val_labels_s, val_labels_l])
-        val_mae = mean_absolute_error(all_val_labels, all_val_preds)
+        val_preds_l, val_labels_l = val_model(model, l_val_loader, cpu_device)
+        if len(val_preds_s) > 0 and len(val_preds_l) > 0:
+            all_val_preds = np.concatenate([val_preds_s, val_preds_l])
+            all_val_labels = np.concatenate([val_labels_s, val_labels_l])
+        elif len(val_preds_s) > 0:
+            all_val_preds = val_preds_s
+            all_val_labels = val_labels_s
+        else:
+            all_val_preds = val_preds_l
+            all_val_labels = val_labels_l
+        
+        if len(all_val_labels) > 0:
+            val_auc = roc_auc_score(all_val_labels, all_val_preds)
+        else:
+            val_auc = 0.0
+
 
         model.to(gpu_device)
-        test_preds_s, test_labels_s = test_model(model, s_test_loader, gpu_device, clamp_min, clamp_max)
+        test_preds_s, test_labels_s = test_model(model, s_test_loader, gpu_device)
         model.to(cpu_device)
-        test_preds_l, test_labels_l = test_model(model, l_test_loader, cpu_device, clamp_min, clamp_max)
-        all_test_preds = np.concatenate([test_preds_s, test_preds_l])
-        all_test_labels = np.concatenate([test_labels_s, test_labels_l])
-        test_mae = mean_absolute_error(all_test_labels, all_test_preds)
+        test_preds_l, test_labels_l = test_model(model, l_test_loader, cpu_device)
+        if len(test_preds_s) > 0 and len(test_preds_l) > 0:
+            all_test_preds = np.concatenate([test_preds_s, test_preds_l])
+            all_test_labels = np.concatenate([test_labels_s, test_labels_l])
+        elif len(test_preds_s) > 0:
+            all_test_preds = test_preds_s
+            all_test_labels = test_labels_s
+        else:
+            all_test_preds = test_preds_l
+            all_test_labels = test_labels_l
 
+        if len(all_test_labels) > 0:
+            test_auc = roc_auc_score(all_test_labels, all_test_preds)
+        else:
+            test_auc = 0.0
+
+        
         print(f"Epoch {epoch+1} Results -> Train Loss: {train_loss:.4f} (Primary: {primary_loss:.4f}, Orthogonal: {orthogonal_loss:.6f}), "
-              f"Val MAE: {val_mae:.4f}, Test MAE: {test_mae:.4f}")
+              f"Val AUC: {val_auc:.4f}, Test AUC: {test_auc:.4f}")
 
-        if val_mae < best_val_mae:
-            best_val_mae = val_mae
-            best_test_mae = test_mae
-    
-    print(f"\nBest Validation MAE: {best_val_mae:.4f}")
-    print(f"Corresponding Test MAE: {best_test_mae:.4f}")
+        epoch_details.append({
+            'epoch': epoch + 1,
+            'train_loss': train_loss,
+            'primary_loss': primary_loss,
+            'orthogonal_loss': orthogonal_loss,
+            'val_auc': val_auc,
+            'test_auc': test_auc
+        })
+
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            best_test_auc = test_auc
+        if train_loss < best_train_loss:
+            best_train_loss = train_loss
+        if primary_loss < best_primary_loss:
+            best_primary_loss = primary_loss    
+        if orthogonal_loss < best_orthogonal_loss:
+            best_orthogonal_loss = orthogonal_loss
+
+    print("\nModel hyperparameters:")
+    print(f"  hidden_channels: {args.hidden_channels}")
+    print(f"  num_heads: {args.num_heads}")
+    print(f"  ssagg_lambda: {args.ssagg_lambda}")
+    print(f"  dropout: {args.dropout}")
+    print(f"  orthogonal_lambda: {args.orthogonal_lambda}")
+
+    print("\nTraining complete. Final results:")
+    for detail in epoch_details:
+        print(f"Epoch {detail['epoch']}: Train Loss: {detail['train_loss']:.4f}, "
+              f"Primary Loss: {detail['primary_loss']:.4f}, Orthogonal Loss: {detail['orthogonal_loss']:.6f}, "
+              f"Val AUC: {detail['val_auc']:.4f}, Test AUC: {detail['test_auc']:.4f}")
+    print(f"\nBest Validation AUC: {best_val_auc:.4f}")
+    print(f"Corresponding Test AUC: {best_test_auc:.4f}")
+    print(f"Best Train Loss: {best_train_loss:.4f}")    
+    print(f"Best Primary Loss: {best_primary_loss:.4f}")
+    print(f"Best Orthogonal Loss: {best_orthogonal_loss:.6f}")
