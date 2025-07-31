@@ -41,6 +41,8 @@ A brief overview of the key files and directories in this repository:
 
     ```bash
     pip install -r requirements.txt
+    pip install torch_geo/*.whl
+    pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu118
     ```
 
 3.  **Download RelBench Data**
