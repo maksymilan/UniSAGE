@@ -10,6 +10,8 @@ A brief overview of the key files and directories in this repository:
 
 ```
 .
+├── requirements.txt
+├── torch_geo/
 ├── model/
 │   ├── UniSAGE.py
 │   └── SSAgg.py
@@ -32,8 +34,7 @@ A brief overview of the key files and directories in this repository:
 1.  **Clone the Repository**
 
     ```bash
-    git clone https://github.com/maksymilan/SDHyperStructureP.git
-    cd SDHyperStructureP
+    git clone <repo-url>
     ```
 
 2.  **Install Dependencies**
