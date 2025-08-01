@@ -1,4 +1,4 @@
-# SDHyperStructureP
+# UniSAGE：Unifying Static and Dynamic Attributes with Hyper-Structure
 
 This project introduces a framework for training Graph Neural Network models on complex, heterogeneous graphs by orthogonally collecting dynamic and static information. Compared to conventional methods that mix different information types, our approach avoids potential information loss that can occur during the fusion process. By preserving the distinct characteristics of dynamic and static features, the model can learn more robust and informative representations for predictive tasks.
 
