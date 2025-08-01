@@ -67,7 +67,7 @@ A brief overview of the key files and directories in this repository:
         print(f"Downloading dataset and tasks for: {name}...")
         try:
             # The get_db() method downloads both the database tables and all associated task files.
-            get_dataset(name).get_db()
+            get_dataset(name)
             print(f"Successfully downloaded {name}.")
         except Exception as e:
             print(f"Failed to download {name}. Error: {e}")
